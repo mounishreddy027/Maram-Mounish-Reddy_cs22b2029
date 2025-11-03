@@ -1,0 +1,7 @@
+websockets
+psycopg2-binary
+fastapi
+uvicorn[standard]
+pandas
+statsmodels
+numpy

@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  # 1. Database Service (PostgreSQL + TimescaleDB)
+  db:
+    image: timescale/timescaledb:latest-pg14
+    container_name: quant_db
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=quantdb
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432" # Expose DB port to host (optional, for debugging)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d quantdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 2. Backend - Ingestor Service
+  ingestor:
+    build: ./backend
+    container_name: quant_ingestor
+    command: python ingestor.py
+    environment:
+      - DATABASE_URL=postgresql://user:password@db/quantdb
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: on-failure
+
+  # 3. Backend - Aggregator Service
+  aggregator:
+    build: ./backend
+    container_name: quant_aggregator
+    command: python aggregator.py
+    environment:
+      - DATABASE_URL=postgresql://user:password@db/quantdb
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: on-failure
+
+  # 4. Backend - API Service
+  api:
+    build: ./backend
+    container_name: quant_api
+    command: uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      - DATABASE_URL=postgresql://user:password@db/quantdb
+    ports:
+      - "8000:8000" # Expose API port to host
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: on-failure
+
+  # 5. Frontend - Streamlit Service
+  frontend:
+    build: ./frontend
+    container_name: quant_frontend
+    ports:
+      - "8501:8501" # Expose Streamlit port
+    depends_on:
+      - api
+    restart: on-failure
+
+volumes:
+  postgres_data:

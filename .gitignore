@@ -1,0 +1,20 @@
+Docker
+
+postgres_data/
+
+Python
+
+pycache/
+*.pyc
+*.pyo
+*.pyd
+
+Environment
+
+.env
+venv/
+
+IDE files
+
+.vscode/
+.idea/
