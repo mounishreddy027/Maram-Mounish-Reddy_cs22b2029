@@ -133,7 +133,6 @@ def plot_pair_analytics(df, sym1, sym2):
     )
     return fig
 
-# --- NEW: Local Analytics Function ---
 def run_local_pair_analytics(df_pivot, sym1, sym2, window):
     """Runs the same analytics as the API, but locally on a DataFrame."""
     df = df_pivot.copy()

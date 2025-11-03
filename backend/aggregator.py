@@ -12,10 +12,10 @@ def refresh_views():
     sql_1m = "CALL refresh_continuous_aggregate('ohlc_1m', NULL, NULL);"
     sql_5m = "CALL refresh_continuous_aggregate('ohlc_5m', NULL, NULL);"
 
-    conn = None  # Initialize connection variable
+    conn = None  
     try:
         conn = psycopg2.connect(DATABASE_URL)
-        conn.autocommit = True  # <-- THE FIX: Enable autocommit
+        conn.autocommit = True 
 
         with conn.cursor() as curs:
             logging.info("Refreshing ohlc_1m...")
@@ -28,8 +28,7 @@ def refresh_views():
         logging.error(f"Error refreshing views: {e}")
     finally:
         if conn:
-            conn.close()  # Always close the connection
-
+            conn.close()  
 if __name__ == "__main__":
     while True:
         refresh_views()

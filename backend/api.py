@@ -139,7 +139,6 @@ def get_pair_analytics(
     except Exception:
         adf_stats = {"error": "ADF test failed to converge"}
 
-    # --- THIS IS THE NEW FIX ---
     # 1. Replace all Infinity and -Infinity values with NaN
     df = df.replace([np.inf, -np.inf], np.nan)
     # 2. Convert DataFrame to object type, then replace all NaN with None
