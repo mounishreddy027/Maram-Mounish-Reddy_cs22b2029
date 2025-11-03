@@ -156,7 +156,8 @@ This project is a complete, end-to-end analytical application built for quantita
 
 2. **Navigate** to the project root directory
    ```bash
-   cd quant-analytics-dashboard
+   cd repo_name
+   
    ```
 
 3. **Start the stack**
