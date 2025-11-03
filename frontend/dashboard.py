@@ -7,6 +7,8 @@ import time
 import numpy as np
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
+from pykalman import KalmanFilter
+from sklearn.linear_model import HuberRegressor, TheilSenRegressor # <-- NEW IMPORT
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -45,6 +47,7 @@ def get_ohlc_data(symbol, timeframe):
         # Convert the index (already in UTC) to IST
         df.index = df.index.tz_convert('Asia/Kolkata')
         
+        # API now sorts ASC
         return df
         
     except requests.RequestException as e:
@@ -52,16 +55,20 @@ def get_ohlc_data(symbol, timeframe):
         return pd.DataFrame()
 
 @st.cache_data(ttl=10)
-def get_pair_analytics(sym1, sym2, timeframe, window):
+def get_pair_analytics(sym1, sym2, timeframe, window, regression_type):
     """Get pair analytics (z-score, OLS, etc.) from API."""
-    params = {"sym1": sym1, "sym2": sym2, "timeframe": timeframe, "window": window}
+    params = {
+        "sym1": sym1, 
+        "sym2": sym2, 
+        "timeframe": timeframe, 
+        "window": window,
+        "regression_type": regression_type
+    }
     try:
         res = requests.get(f"{API_BASE_URL}/analytics/pair", params=params)
         
         if res.status_code == 404:
-            # We will handle this in the main UI
             return pd.DataFrame(), 0, {}
-        
         elif res.status_code == 500:
             st.error("Whoops! The analytics server ran into an error. Please check the `api` service logs for details.")
             return pd.DataFrame(), 0, {}
@@ -106,34 +113,47 @@ def plot_price(df, symbol):
     )
     return fig
 
-def plot_pair_analytics(df, sym1, sym2):
-    """Plots spread, z-score, and correlation."""
+def plot_pair_analytics(df, sym1, sym2, regression_type):
+    """Plots spread, z-score, correlation, and (optional) hedge ratio."""
+    
+    has_dynamic_hedge = 'hedge_ratio' in df.columns
+    # Only show 4 rows if it's Kalman AND the hedge_ratio column exists
+    rows = 4 if (regression_type == 'kalman' and has_dynamic_hedge) else 3
+    titles = (f"{sym1}-{sym2} Spread", "Z-Score", "Rolling Correlation")
+    if rows == 4:
+        titles = ("Dynamic Hedge Ratio",) + titles
+
     fig = make_subplots(
-        rows=3, cols=1,
+        rows=rows, cols=1,
         shared_xaxes=True,
-        subplot_titles=(f"{sym1}-{sym2} Spread", "Z-Score", "Rolling Correlation"),
-        vertical_spacing=0.1
+        subplot_titles=titles,
+        vertical_spacing=0.05
     )
     
-    # Spread
-    fig.add_trace(go.Scatter(x=df.index, y=df['spread'], name='Spread'), row=1, col=1)
-    
-    # Z-Score
-    fig.add_trace(go.Scatter(x=df.index, y=df['z_score'], name='Z-Score'), row=2, col=1)
-    fig.add_hline(y=2.0, line_dash="dash", line_color="red", row=2, col=1)
-    fig.add_hline(y=-2.0, line_dash="dash", line_color="red", row=2, col=1)
-    
-    # Correlation
-    fig.add_trace(go.Scatter(x=df.index, y=df['correlation'], name='Correlation'), row=3, col=1)
+    row_num = 1
+    if rows == 4:
+        fig.add_trace(go.Scatter(x=df.index, y=df['hedge_ratio'], name='Kalman Beta'), row=row_num, col=1)
+        row_num += 1
+
+    fig.add_trace(go.Scatter(x=df.index, y=df['spread'], name='Spread'), row=row_num, col=1)
+    row_num += 1
+
+    fig.add_trace(go.Scatter(x=df.index, y=df['z_score'], name='Z-Score'), row=row_num, col=1)
+    fig.add_hline(y=2.0, line_dash="dash", line_color="red", row=row_num, col=1)
+    fig.add_hline(y=-2.0, line_dash="dash", line_color="red", row=row_num, col=1)
+    row_num += 1
+
+    fig.add_trace(go.Scatter(x=df.index, y=df['correlation'], name='Correlation'), row=row_num, col=1)
     
     fig.update_layout(
-        height=600, 
-        title_text="Pair Analytics",
+        height=800 if rows == 4 else 600, 
+        title_text=f"Pair Analytics ({regression_type.upper()})",
         uirevision="bar"
     )
     return fig
 
-def run_local_pair_analytics(df_pivot, sym1, sym2, window):
+# --- UPDATED Local Analytics Function ---
+def run_local_pair_analytics(df_pivot, sym1, sym2, window, regression_type):
     """Runs the same analytics as the API, but locally on a DataFrame."""
     df = df_pivot.copy()
     
@@ -141,14 +161,50 @@ def run_local_pair_analytics(df_pivot, sym1, sym2, window):
         st.warning(f"Not enough data for a rolling window of {window}. Please upload a larger file.")
         return pd.DataFrame(), 0, {}
 
-    # 1. OLS Hedge Ratio
-    y = df[sym1]
-    X = sm.add_constant(df[sym2])
-    model = sm.OLS(y, X).fit()
-    hedge_ratio = model.params.get(sym2, 0)
+    hedge_ratio = 0
+    y = df[sym1].values
+    X = df[sym2].values.reshape(-1, 1) # sklearn needs 2D
     
-    # 2. Spread & Z-Score
-    df['spread'] = df[sym1] - hedge_ratio * df[sym2]
+    if regression_type == "ols":
+        X_with_const = sm.add_constant(df[sym2]) # OLS needs constant
+        model = sm.OLS(y, X_with_const).fit()
+        hedge_ratio = model.params.get(sym2, 0)
+        intercept = model.params.get('const', 0)
+        df['spread'] = df[sym1] - (hedge_ratio * df[sym2] + intercept)
+
+    elif regression_type == "huber":
+        model = HuberRegressor().fit(X, y)
+        hedge_ratio = model.coef_[0]
+        intercept = model.intercept_
+        df['spread'] = df[sym1] - (hedge_ratio * df[sym2] + intercept)
+
+    elif regression_type == "theilsen":
+        model = TheilSenRegressor().fit(X, y)
+        hedge_ratio = model.coef_[0]
+        intercept = model.intercept_
+        df['spread'] = df[sym1] - (hedge_ratio * df[sym2] + intercept)
+    
+    else: # regression_type == "kalman"
+        obs_matrix = np.vstack([df[sym2], np.ones(len(df[sym2]))]).T[:, np.newaxis, :]
+
+        kf = KalmanFilter(
+            transition_matrices = [[1, 0], [0, 1]],
+            observation_matrices = obs_matrix,
+            initial_state_mean = [0, 0],
+            initial_state_covariance = [[1, 0], [0, 1]],
+            transition_covariance = [[1e-5, 0], [0, 1e-5]],
+            observation_covariance = 1.0
+        )
+        
+        state_means, _ = kf.filter(y)
+        
+        df['hedge_ratio'] = state_means[:, 0]
+        df['intercept'] = state_means[:, 1]
+        
+        df['spread'] = df[sym1] - (df['hedge_ratio'] * df[sym2] + df['intercept'])
+        hedge_ratio = state_means[-1, 0] # latest
+    
+    # 2. Z-Score
     rolling_mean = df['spread'].rolling(window=window).mean()
     rolling_std = df['spread'].rolling(window=window).std()
     df['z_score'] = (df['spread'] - rolling_mean) / rolling_std
@@ -175,31 +231,36 @@ def run_local_pair_analytics(df_pivot, sym1, sym2, window):
 
 # --- Main Dashboard UI ---
 
-st.title("Quant Analysis")
+st.title(" Quant Analysis Dashboard ")
 
-# --- NEW: Sidebar Data Source Selector ---
 data_source = st.sidebar.radio("Data Source", ["Live Feed", "File Upload"])
 st.sidebar.divider()
+
+# --- UPDATED REGRESSION FORMATTING ---
+REGRESSION_FORMAT_MAP = {
+    "ols": "OLS (Static)",
+    "kalman": "Kalman (Dynamic)",
+    "huber": "Huber (Robust)",
+    "theilsen": "Theil-Sen (Robust)"
+}
+REGRESSION_OPTIONS = ["ols", "huber", "theilsen", "kalman"]
 
 if data_source == "Live Feed":
     
     st.sidebar.header("Live Controls")
     analysis_type = st.sidebar.radio("Analysis Type", ["Single Symbol", "Pair Trading"])
+    available_symbols = get_symbols()
 
     if analysis_type == "Single Symbol":
-        # --- Single Symbol View ---
         st.sidebar.subheader("Symbol Selection")
-        available_symbols = get_symbols()
         symbol = st.sidebar.selectbox("Symbol", available_symbols, index=0)
         timeframe = st.sidebar.selectbox("Timeframe", ["1s", "1m", "5m"], index=1)
         
         st.header(f"Live Analytics for: {symbol}")
         
-        # Fetch data
         ohlc_data = get_ohlc_data(symbol, timeframe)
         
         if not ohlc_data.empty:
-            
             try:
                 latest_price = ohlc_data['close'].iloc[-1]
                 latest_volume = ohlc_data['volume'].iloc[-1]
@@ -228,34 +289,40 @@ if data_source == "Live Feed":
     else:
         # --- Pair Trading View ---
         st.sidebar.subheader("Symbol Selection")
-        available_symbols = get_symbols()
         sym1 = st.sidebar.selectbox("Symbol 1 (Y)", available_symbols, index=0)
         sym2 = st.sidebar.selectbox("Symbol 2 (X)", available_symbols, index=1)
         
         st.sidebar.subheader("Analytics Parameters")
+        # --- UPDATED REGRESSION TYPE SELECTOR ---
+        regression_type = st.sidebar.radio(
+            "Regression Type",
+            REGRESSION_OPTIONS,
+            format_func=lambda x: REGRESSION_FORMAT_MAP.get(x, x.upper())
+        )
         timeframe = st.sidebar.selectbox("Timeframe", ["1m", "5m"], index=0)
         window = st.sidebar.number_input("Rolling Window", min_value=5, max_value=200, value=20) 
         
         st.header(f"Live Pair Analytics: {sym1} / {sym2}")
         
-        # Fetch data
-        pair_data, hedge_ratio, adf_stats = get_pair_analytics(sym1, sym2, timeframe, window)
+        pair_data, hedge_ratio, adf_stats = get_pair_analytics(sym1, sym2, timeframe, window, regression_type)
         
         if not pair_data.empty:
             try:
                 latest_zscore = pair_data['z_score'].iloc[-1]
                 latest_spread = pair_data['spread'].iloc[-1]
-                latest_corr = pair_data['correlation'].iloc[-1]
-
+                
                 st.subheader("Live Stats")
                 col1, col2, col3 = st.columns(3)
                 col1.metric("Latest Z-Score", f"{latest_zscore:.4f}")
                 col2.metric("Latest Spread", f"{latest_spread:.4f}")
-                col3.metric("Latest Correlation", f"{latest_corr:.4f}")
+                
+                if 'correlation' in pair_data.columns and not pd.isna(pair_data['correlation'].iloc[-1]):
+                     latest_corr = pair_data['correlation'].iloc[-1]
+                     col3.metric("Latest Correlation", f"{latest_corr:.4f}")
 
                 st.subheader("Pair Configuration")
                 col4, col5 = st.columns(2)
-                col4.metric("Hedge Ratio (OLS)", f"{hedge_ratio:.4f}")
+                col4.metric(f"Hedge Ratio ({REGRESSION_FORMAT_MAP[regression_type]})", f"{hedge_ratio:.4f}")
                 col5.metric("Is Spread Stationary (ADF)?", "Yes" if adf_stats.get('is_stationary_5pct') else "No")
 
                 if not pd.isna(latest_zscore) and abs(latest_zscore) > 2.0:
@@ -266,7 +333,7 @@ if data_source == "Live Feed":
 
             st.divider()
 
-            st.plotly_chart(plot_pair_analytics(pair_data, sym1, sym2), use_container_width=True)
+            st.plotly_chart(plot_pair_analytics(pair_data, sym1, sym2, regression_type), use_container_width=True)
 
             st.download_button(
                 label="Download Pair Data as CSV",
@@ -278,7 +345,6 @@ if data_source == "Live Feed":
         else:
             st.warning("No data available for this selection. Please wait for data to be ingested.")
 
-    # Simple auto-refresh for "live" feel
     time.sleep(5)
     st.rerun()
 
@@ -291,7 +357,6 @@ else: # data_source == "File Upload"
         try:
             df = pd.read_csv(uploaded_file)
             
-            # --- Validate and Clean Uploaded Data ---
             required_cols = ['timestamp', 'symbol', 'open', 'high', 'low', 'close', 'volume']
             if not all(col in df.columns for col in required_cols):
                 st.error(f"Invalid CSV. Must contain columns: {', '.join(required_cols)}")
@@ -321,18 +386,22 @@ else: # data_source == "File Upload"
                     sym2 = st.sidebar.selectbox("Symbol 2 (X)", symbols, index=1 if len(symbols) > 1 else 0)
                     
                     st.sidebar.subheader("Analytics Parameters")
+                    # --- UPDATED REGRESSION TYPE SELECTOR ---
+                    regression_type = st.sidebar.radio(
+                        "Regression Type",
+                        REGRESSION_OPTIONS,
+                        format_func=lambda x: REGRESSION_FORMAT_MAP.get(x, x.upper())
+                    )
                     window = st.sidebar.number_input("Rolling Window", min_value=5, max_value=200, value=20) 
                     
                     st.header(f"File Pair Analytics: {sym1} / {sym2}")
 
-                    # Prepare data for local analytics
                     df1 = df[df['symbol'] == sym1]['close']
                     df2 = df[df['symbol'] == sym2]['close']
                     pair_df = pd.concat([df1, df2], axis=1, join='inner')
                     pair_df.columns = [sym1, sym2]
                     
-                    # Run local analytics
-                    analytics_df, hedge_ratio, adf_stats = run_local_pair_analytics(pair_df, sym1, sym2, window)
+                    analytics_df, hedge_ratio, adf_stats = run_local_pair_analytics(pair_df, sym1, sym2, window, regression_type)
                     
                     if not analytics_df.empty:
                         try:
@@ -348,7 +417,7 @@ else: # data_source == "File Upload"
 
                             st.subheader("Pair Configuration")
                             col4, col5 = st.columns(2)
-                            col4.metric("Hedge Ratio (OLS)", f"{hedge_ratio:.4f}")
+                            col4.metric(f"Hedge Ratio ({REGRESSION_FORMAT_MAP[regression_type]})", f"{hedge_ratio:.4f}")
                             col5.metric("Is Spread Stationary (ADF)?", "Yes" if adf_stats.get('is_stationary_5pct') else "No")
 
                         except Exception as e:
@@ -356,7 +425,7 @@ else: # data_source == "File Upload"
 
                         st.divider()
 
-                        st.plotly_chart(plot_pair_analytics(analytics_df, sym1, sym2), use_container_width=True)
+                        st.plotly_chart(plot_pair_analytics(analytics_df, sym1, sym2, regression_type), use_container_width=True)
                         st.dataframe(analytics_df.tail())
                     else:
                         st.warning("Not enough data in the file to run pair analytics.")
@@ -366,3 +435,4 @@ else: # data_source == "File Upload"
             st.stop()
     else:
         st.info("Upload a CSV file to begin analysis. The CSV must contain the columns: `timestamp`, `symbol`, `open`, `high`, `low`, `close`, `volume`.")
+

@@ -5,3 +5,5 @@ uvicorn[standard]
 pandas
 statsmodels
 numpy
+pykalman
+scikit-learn
